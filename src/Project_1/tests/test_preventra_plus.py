@@ -58,10 +58,19 @@ def context():
 
 
 class MemoryPlans:
-    def __init__(self):
+    def __init__(self, conversations=None):
+        self.conversations = conversations
         self.rows = {}
         self.fail_load = False
         self.fail_save = False
+
+    def worker_recent(self):
+        return [c for c in self.conversations.list_recent() if c.conversation_id not in self.rows]
+
+    def list_plans(self):
+        return [{'id': identifier, 'site': saved.snapshot['plan']['site'],
+                 'days': sorted({i['day'] for i in saved.snapshot['plan']['items']})}
+                for identifier, saved in reversed(list(self.rows.items())) if saved.snapshot]
 
     def load(self, identifier):
         if self.fail_load:
@@ -165,7 +174,11 @@ class PlanDomainTests(unittest.TestCase):
 
 class PlusUITests(unittest.TestCase):
     def setUp(self):
-        self.store, self.plans = MemoryStore(), MemoryPlans()
+        self.store = MemoryStore()
+        self.plans = MemoryPlans(self.store)
+        from preventra_agent.models import ToolResult
+        self.report_search = patch('preventra_plan.report.search_cases',
+                                   return_value=ToolResult('search_sif_cases', 'empty')).start()
         patch('streamlit.testing.v1.element_tree.get_widget_state', side_effect=browser_widget_state).start()
         patch('preventra_ui.state.get_store', return_value=self.store).start()
         patch('preventra_plan.ui.get_plan_store', return_value=self.plans).start()
@@ -190,6 +203,13 @@ class PlusUITests(unittest.TestCase):
         app.session_state['plus_candidate'] = plan or domain.read_work_plan(workbook_bytes())
         app.run()
         self.click(app, 'plus_apply')
+
+    def restore(self, app, identifier):
+        self.click(app, 'preventra_sidebar_home')
+        app.session_state['plus_home_tabs'] = '관리자'
+        app.run()
+        day = self.plans.rows[identifier].snapshot['day']
+        self.click(app, f'plus_plan_{identifier}_{day}')
 
     def test_home_is_simple_and_actual_upload_preview_requires_apply(self):
         with patch('streamlit.file_uploader', return_value=BytesIO(workbook_bytes())):
@@ -216,7 +236,7 @@ class PlusUITests(unittest.TestCase):
         self.assertEqual(app.session_state['plus_saved'], SavedPlan())
         self.assertIsNone(app.session_state['plus_candidate'])
         restored = self.app()
-        self.click(restored, 'preventra_conversation_' + identifier)
+        self.restore(restored, identifier)
         self.assertIsNotNone(restored.session_state['plus_saved'].snapshot)
         self.assertEqual(len(restored.chat_message), 2)
         self.dispatch.assert_called_once()
@@ -263,7 +283,7 @@ class PlusUITests(unittest.TestCase):
         identifier = app.session_state['preventra_conversation_id']
         self.click(app, 'preventra_new_chat')
         self.plans.fail_load = True
-        self.click(app, 'preventra_conversation_' + identifier)
+        self.restore(app, identifier)
         self.assertTrue(app.chat_input[0].disabled)
         self.assertIsNone(app.session_state['plus_saved'].snapshot)
         self.dispatch.assert_not_called()
@@ -315,9 +335,9 @@ class PlusUITests(unittest.TestCase):
             self.assertEqual([turn.question for turn in request.history], questions[:index])
         self.assertEqual(self.dispatch.call_count, 3)
         self.click(app, 'preventra_new_chat')
-        self.click(app, 'preventra_conversation_' + identifier)
+        self.restore(app, identifier)
         self.assertEqual(app.date_input('plus_day').value, future)
-        self.assertEqual(app.selectbox('plus_work').value, 'A')
+        self.assertEqual(app.selectbox('plus_work').value, '')  # Date navigation opens the full day.
         app.chat_input[0].set_value('앞에서 말한 내용 더 짧게 정리해 줘').run()
         self.assertEqual(len(self.dispatch.call_args.args[0].history), 3)
 
@@ -342,6 +362,59 @@ class PlusUITests(unittest.TestCase):
         self.click(app,'pv2_example_지게차 사고사례')
         self.assertNotEqual(app.session_state['preventra_conversation_id'],identifier)
         self.assertEqual(self.dispatch.call_args.args[0].context,{})
+
+    def test_role_history_plan_groups_dates_and_automatic_report(self):
+        app = self.app()
+        app.session_state['preventra_page'] = '안전 어시스턴트'
+        app.run()
+        app.chat_input[0].set_value('작업자 질문').run()
+        worker_id = app.session_state['preventra_conversation_id']
+        self.click(app, 'preventra_sidebar_home')
+        plan = domain.read_work_plan(workbook_bytes())
+        future = domain.today_korea() + timedelta(days=6)
+        plan = replace(plan, items=(replace(plan.items[0], day=future),
+                                   replace(plan.items[1], day=future + timedelta(days=1))))
+        self.apply(app, plan)
+        manager_id = app.session_state['preventra_conversation_id']
+        self.assertEqual(app.date_input('plus_day').value, future)
+        self.assertTrue(any('작업 안전 보고서' in h.value for h in app.markdown))
+        self.assertEqual(app.metric[0].value, '1개')
+        self.assertNotIn('preventra_conversation_' + worker_id, [b.key for b in app.button])
+        calls = self.report_search.call_count
+        app.run()
+        self.assertEqual(self.report_search.call_count, calls)
+        second = (future + timedelta(days=1)).isoformat()
+        self.click(app, f'plus_plan_{manager_id}_{second}')
+        self.assertEqual(app.date_input('plus_day').value.isoformat(), second)
+        self.assertEqual(self.plans.rows[manager_id].snapshot['day'], second)
+        self.click(app, 'preventra_sidebar_home')
+        app.session_state['plus_home_tabs'] = '작업자'
+        app.run()
+        self.assertIn('preventra_conversation_' + worker_id, [b.key for b in app.button])
+        self.assertFalse(any((b.key or '').startswith('plus_plan_') for b in app.button))
+
+    def test_report_lookup_failure_does_not_block_followup(self):
+        from preventra_agent.models import ToolResult
+        self.report_search.return_value = ToolResult('search_sif_cases', 'error')
+        app = self.app()
+        self.apply(app)
+        self.assertTrue(any('관련 사고사례를 불러오지 못했습니다' in w.value for w in app.warning))
+        self.assertFalse(app.chat_input[0].disabled)
+        app.chat_input[0].set_value('이 작업의 계획 안전조치는?').run()
+        self.assertFalse(app.exception)
+        self.assertIn('work_plan', self.dispatch.call_args.args[0].context)
+
+
+class ReportTests(unittest.TestCase):
+    def test_chart_escapes_plan_text_and_deduplicates_explicit_types(self):
+        from preventra_plan.report import timeline_html, case_counts
+        from preventra_agent.models import Evidence
+        plan = domain.read_work_plan(workbook_bytes())
+        item = replace(plan.items[0], activity='<script>alert(1)</script>')
+        self.assertNotIn('<script>', timeline_html([item], []))
+        evidence = Evidence('SIF-1', 'sif', '사례', '사고유형: 끼임\n작업: 운반', {'doc_id':'one'})
+        unknown = Evidence('SIF-3', 'sif', '사례2', '유형 확인 불가', {'doc_id':'two'})
+        self.assertEqual(case_counts([evidence, evidence, unknown]), {'끼임':1, '유형 미기재':1})
 
 
 if __name__ == '__main__':

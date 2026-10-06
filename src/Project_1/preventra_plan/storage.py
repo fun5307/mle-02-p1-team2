@@ -36,6 +36,28 @@ class PlanStore:
         validate_snapshot(result.snapshot)
         return result
 
+    def worker_recent(self):
+        from preventra_ui.history import Conversation
+        with self.conversations.connection_factory() as conn:
+            rows = conn.execute("""SELECT c.conversation_id, c.title, c.created_at, c.updated_at
+                FROM preventra_conversations c WHERE c.scope=%s AND NOT EXISTS
+                (SELECT 1 FROM preventra_work_plans p WHERE p.conversation_id=c.conversation_id)
+                ORDER BY c.updated_at DESC, c.conversation_id DESC LIMIT 50""",
+                (self.conversations.scope,)).fetchall()
+        return [Conversation(str(row[0]), *row[1:]) for row in rows]
+
+    def list_plans(self):
+        # Only metadata crosses the connection; don't load every full plan for navigation.
+        with self.conversations.connection_factory() as conn:
+            rows = conn.execute("""SELECT c.conversation_id, p.snapshot->'plan'->>'site',
+                ARRAY(SELECT DISTINCT item->>'day' FROM
+                    jsonb_array_elements(p.snapshot->'plan'->'items') item ORDER BY 1)
+                FROM preventra_work_plans p JOIN preventra_conversations c USING(conversation_id)
+                WHERE c.scope=%s AND p.snapshot IS NOT NULL
+                ORDER BY c.updated_at DESC, p.updated_at DESC, c.conversation_id DESC""",
+                (self.conversations.scope,)).fetchall()
+        return [{'id': str(row[0]), 'site': row[1], 'days': row[2]} for row in rows]
+
     def save(self, conversation_id, value, expected_revision):
         validate_snapshot(value)
         with self.conversations.connection_factory() as conn:

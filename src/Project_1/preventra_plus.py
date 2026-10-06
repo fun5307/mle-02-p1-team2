@@ -11,7 +11,7 @@ def main():
     state.initialize()
     ui.initialize()
     views.apply_style()
-    views.render_sidebar()
+    ui.render_sidebar()
     with st.container(key="pv2_app"):
         views.render_header()
         page = st.session_state.preventra_page

@@ -65,6 +65,96 @@ def is_manager():
                 any(turn['request'].context.get('work_plan') for turn in st.session_state.preventra_turns))
 
 
+def sidebar_role():
+    if st.session_state.preventra_page == '홈':
+        return st.session_state.get('plus_home_tabs', st.session_state.get('plus_home_role', '작업자'))
+    if st.session_state.preventra_page == '안전 어시스턴트':
+        return '관리자' if is_manager() else '작업자'
+    return st.session_state.get('plus_home_role', '작업자')
+
+
+def open_plan_day(identifier, day):
+    if blocked():
+        return
+    if identifier != st.session_state.preventra_conversation_id:
+        state.open_conversation(identifier)
+        if st.session_state.preventra_conversation_id != identifier:
+            return
+        initialize()
+    if st.session_state.plus_load_failed:
+        return
+    previous = st.session_state.plus_saved.snapshot
+    if previous and save({**previous, 'day': day, 'work_id': None}):
+        st.session_state.plus_day = date.fromisoformat(day)
+        st.session_state.plus_work = ''
+        st.session_state.plus_home_role = '관리자'
+        state.navigate('안전 어시스턴트')
+
+
+def new_plan_home():
+    if not blocked():
+        st.session_state.plus_home_tabs = '관리자'
+        st.session_state.plus_home_role = '관리자'
+        state.navigate('홈')
+
+
+def render_sidebar():
+    role = sidebar_role()
+    with st.sidebar, st.container(key='preventra_sidebar'):
+        st.html('<div class="pv-brand">Preventra<span aria-hidden="true"> ◈</span></div>')
+        st.caption(role + ' 작업공간')
+        st.button('새 대화' if role == '작업자' else '작업자 새 대화', key='preventra_new_chat',
+                  on_click=state.new_chat, disabled=blocked(), width='stretch')
+        if role == '관리자':
+            st.button('작업계획서 연결', on_click=new_plan_home, disabled=blocked(), width='stretch')
+        if st.session_state.preventra_history_notice:
+            st.warning(st.session_state.preventra_history_notice)
+            st.button('저장 다시 시도' if st.session_state.preventra_unsaved else '목록 새로고침',
+                      key='preventra_retry_save', on_click=state.retry_save, width='stretch')
+        st.markdown('### ' + ('작업자 대화' if role == '작업자' else '작업계획서 이력'))
+        try:
+            store = get_plan_store()
+            if role == '작업자':
+                entries = store.worker_recent()
+                for c in entries:
+                    st.button(c.title, key='preventra_conversation_' + c.conversation_id,
+                              on_click=state.open_conversation, args=(c.conversation_id,),
+                              disabled=blocked(), width='stretch',
+                              type='primary' if c.conversation_id == st.session_state.preventra_conversation_id else 'tertiary')
+                if not entries:
+                    st.caption('아직 작업자 대화가 없습니다.')
+            else:
+                groups = {}
+                for entry in store.list_plans():
+                    groups.setdefault(entry['site'] or '이름 없는 현장', []).append(entry)
+                for site, entries in groups.items():
+                    with st.expander(site, expanded=False):
+                        dates = {}
+                        for entry in entries:
+                            for day in entry['days']:
+                                dates.setdefault(day, entry['id'])
+                        for day, identifier in sorted(dates.items()):
+                            d = date.fromisoformat(day)
+                            st.button(f'{d.month}월 {d.day}일', key=f'plus_plan_{identifier}_{day}',
+                                      help=day, on_click=open_plan_day, args=(identifier, day),
+                                      disabled=blocked(), width='stretch')
+                        if len(entries) > 1:
+                            with st.expander(f'이 현장의 저장된 상담 {len(entries)}개'):
+                                for index, entry in enumerate(entries, 1):
+                                    st.button(f'상담 {index} · {entry["days"][0]} 시작',
+                                              key='preventra_conversation_' + entry['id'],
+                                              on_click=state.open_conversation, args=(entry['id'],),
+                                              disabled=blocked(), width='stretch')
+                if not groups:
+                    st.caption('아직 연결한 작업계획서가 없습니다.')
+                st.caption('날짜를 선택하면 해당 일자의 보고서를 엽니다. 같은 계획서의 상담 내용은 이어집니다.')
+        except Exception:
+            st.warning('이력을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.')
+            st.button('이력 다시 불러오기', key='plus_retry_history')
+        st.button('홈으로 돌아가기', key='preventra_sidebar_home', on_click=state.navigate,
+                  args=('홈',), type='tertiary', width='stretch', disabled=blocked())
+
+
 def render_home():
     from preventra_ui_v2 import views
     st.session_state.setdefault('plus_home_tabs', st.session_state.get('plus_home_role', '작업자'))
@@ -122,7 +212,9 @@ def apply_candidate():
             return
         st.session_state.plus_loaded_id = st.session_state.preventra_conversation_id
         st.session_state.plus_saved = SavedPlan()
-    value = domain.snapshot(candidate, domain.today_korea())
+    days = sorted({item.day for item in candidate.items})
+    today = domain.today_korea()
+    value = domain.snapshot(candidate, today if today in days else days[0])
     if save(value):
         for key in ("plus_day", "plus_work"):
             st.session_state.pop(key, None)
@@ -198,6 +290,8 @@ def render_plan():
         st.info(f"{day:%Y-%m-%d}에 등록된 작업이 없습니다. 계획서의 작업일을 선택해 주세요.")
         st.caption("수록 날짜: " + ", ".join(d.isoformat() for d in sorted({i.day for i in plan.items})))
     else:
+        from preventra_plan.report import render_report
+        render_report(plan, day, selected)
         shown = [i for i in items if not selected or i.work_id == selected]
         with st.expander(f'계획 내용 확인 · 작업 {len(shown)}개', expanded=False):
             st.dataframe(_table(shown), hide_index=True, width="stretch")
